@@ -465,10 +465,19 @@ class RAGPipeline:
 
         if path.lower().endswith(".md"):
 
-            return load_markdown_with_sections(
+            loaded = load_markdown_with_sections(
                 path,
                 source_name=source_name,
             )
+
+            for doc in loaded:
+
+                doc.metadata = doc.metadata or {}
+
+                # Always use the real filename.
+                doc.metadata["source"] = source_name
+
+            return loaded
 
         if path.lower().endswith(".pdf"):
 
@@ -491,10 +500,32 @@ class RAGPipeline:
 
             doc.metadata = doc.metadata or {}
 
-            doc.metadata.setdefault(
-                "source",
-                source_name,
-            )
+            # -------------------------------------------------
+            # IMPORTANT:
+            # Always use the uploaded filename instead of
+            # PDF internal metadata such as about:blank.
+            # -------------------------------------------------
+
+            doc.metadata["source"] = source_name
+
+            # -------------------------------------------------
+            # Normalize page number.
+            #
+            # PyPDFLoader normally uses zero-based page numbers.
+            # We display human-friendly one-based page numbers.
+            # -------------------------------------------------
+
+            if doc.metadata.get("page") is not None:
+
+                try:
+
+                    doc.metadata["page"] = (
+                        int(doc.metadata["page"]) + 1
+                    )
+
+                except Exception:
+
+                    pass
 
         return loaded
 
@@ -549,16 +580,7 @@ class RAGPipeline:
             )
 
         # -------------------------------------------------
-        # IMPORTANT:
-        #
-        # Use cosine distance from normalized embeddings.
-        # Chroma returns distance, where:
-        #
-        # 0 = identical
-        # larger = less similar
-        #
-        # We do NOT use 1-distance because distances
-        # can be > 1.
+        # Chroma vector database
         # -------------------------------------------------
 
         self.vectorstore = Chroma.from_documents(
@@ -609,17 +631,12 @@ class RAGPipeline:
         # -------------------------------------------------
         # Convert Chroma distance to relevance.
         #
-        # IMPORTANT FIX:
+        # Chroma returns distance:
         #
-        # OLD:
-        #     relevance = 1 - distance
+        # 0 = very similar
+        # larger = less similar
         #
-        # This produced 0.0 whenever distance > 1.
-        #
-        # NEW:
-        #     relevance = 1 / (1 + distance)
-        #
-        # This always gives a useful value between 0 and 1.
+        # Convert to a 0-1 relevance value.
         # -------------------------------------------------
 
         converted = []
@@ -647,6 +664,15 @@ class RAGPipeline:
             )
 
         pairs = converted
+
+        # -------------------------------------------------
+        # Sort by highest relevance.
+        # -------------------------------------------------
+
+        pairs.sort(
+            key=lambda item: item[1],
+            reverse=True,
+        )
 
         # -------------------------------------------------
         # Role filtering
@@ -901,13 +927,19 @@ IMPORTANT RULES:
 
 1. Answer ONLY using the provided SOURCES.
 2. Do not use outside knowledge.
-3. Do not guess.
+3. Do not guess or infer missing information.
 4. Every factual claim must have a citation such as [S1].
-5. If the SOURCES contain enough information, answer the question.
-6. If the SOURCES do not contain enough information, say:
+5. If the SOURCES contain the answer, answer it directly.
+6. If the SOURCES do not contain the answer, say exactly:
    Not in KB yet.
-7. Keep the answer clear and concise.
-8. At the end include a Sources section.
+7. Do not invent names, colleges, universities, companies,
+   dates, addresses, skills, or any other information.
+8. If the question asks for a specific person or field,
+   only answer if that specific information is explicitly
+   present in the SOURCES.
+9. Keep the answer clear and concise.
+10. At the end include a Sources section listing only the
+    sources used for the answer.
 """
 
         user = f"""
@@ -920,6 +952,11 @@ SOURCES:
 {context}
 
 Answer using ONLY the sources above.
+
+Remember:
+- Do not guess.
+- Do not use outside knowledge.
+- Cite factual statements using [S1], [S2], etc.
 """
 
         # =================================================
