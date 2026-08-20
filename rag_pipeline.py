@@ -1,13 +1,16 @@
 """
 RAG Pipeline Implementation
 
-Upgraded to support:
-- Manifest-driven ingestion (local files)
-- Answer-only-from-sources behavior with a "Not in KB yet." fallback
-- Citations (source + chunk reference) in every answer
-- Lightweight structured logging (JSONL)
-
-Author: Lucas Lorenzo Savino
+Supports:
+- PDF / TXT / Markdown ingestion
+- Local HuggingFace embeddings
+- Gemini or OpenAI LLM
+- Chroma in-memory vector store
+- Role filtering
+- Retrieval threshold
+- Source citations
+- JSONL logging
+- SQLite audit logging
 """
 
 from __future__ import annotations
@@ -16,221 +19,704 @@ import json
 import os
 import re
 import tempfile
-import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from markdown_loader import load_markdown_with_sections
 from langchain_community.vectorstores import Chroma
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.embeddings import HuggingFaceEmbeddings
 
-# Optional Gemini support
+from markdown_loader import load_markdown_with_sections
+
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+# =========================================================
+# HuggingFace embeddings
+# =========================================================
+
 try:
-    from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-except Exception:  # pragma: no cover
-    ChatGoogleGenerativeAI = None  # type: ignore
-    GoogleGenerativeAIEmbeddings = None  # type: ignore
+    from langchain_huggingface import HuggingFaceEmbeddings
+except Exception:
+    HuggingFaceEmbeddings = None
+
+
+# =========================================================
+# Gemini
+# =========================================================
+
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+except Exception:
+    ChatGoogleGenerativeAI = None
+
+
+# =========================================================
+# Project imports
+# =========================================================
 
 import config
 from audit_sqlite import QALogRecord, SQLiteAudit, now_iso
 
 
+# =========================================================
+# Retrieved chunk
+# =========================================================
+
 @dataclass
 class RetrievedChunk:
     doc: Document
     score: float
-    idx: int  # 1-based index for citations
+    idx: int
 
 
-# (moved to audit_sqlite.now_iso)
-
+# =========================================================
+# JSONL Logger
+# =========================================================
 
 class JSONLLogger:
-    """Append-only JSONL logger (no external services)."""
+    """Append-only JSONL logger."""
 
     def __init__(self, path: str = "logs/qa.jsonl"):
+
         self.path = path
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        directory = os.path.dirname(path)
+
+        if directory:
+            os.makedirs(
+                directory,
+                exist_ok=True,
+            )
 
     def log(self, record: dict) -> None:
-        record = {"ts": now_iso(), **record}
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+        record = {
+            "ts": now_iso(),
+            **record,
+        }
+
+        with open(
+            self.path,
+            "a",
+            encoding="utf-8",
+        ) as f:
+
+            f.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+
+# =========================================================
+# RAG Pipeline
+# =========================================================
 
 class RAGPipeline:
-    """RAG pipeline for document Q&A."""
+    """RAG pipeline for document question answering."""
 
-    def __init__(self, logger: Optional[JSONLLogger] = None):
-        self.provider = getattr(config, "PROVIDER", "openai").lower()
-        self.emb_provider = getattr(config, "EMBEDDINGS_PROVIDER", "openai").lower()
+    def __init__(
+        self,
+        logger: Optional[JSONLLogger] = None,
+    ):
 
+        # -------------------------------------------------
+        # Provider
+        # -------------------------------------------------
+
+        self.provider = getattr(
+            config,
+            "PROVIDER",
+            "gemini",
+        ).lower()
+
+        self.emb_provider = getattr(
+            config,
+            "EMBEDDINGS_PROVIDER",
+            "local",
+        ).lower()
+
+        # -------------------------------------------------
         # Embeddings
+        # -------------------------------------------------
+
         if self.emb_provider == "local":
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name=getattr(config, "LOCAL_EMBEDDINGS_MODEL", "all-MiniLM-L6-v2")
-            )
-        elif self.emb_provider == "gemini":
-            if not getattr(config, "GOOGLE_API_KEY", ""):
-                raise ValueError("GOOGLE_API_KEY is required when EMBEDDINGS_PROVIDER=gemini")
-            if GoogleGenerativeAIEmbeddings is None:
+
+            if HuggingFaceEmbeddings is None:
+
                 raise ImportError(
-                    "Gemini dependencies missing. Install: langchain-google-genai google-generativeai"
+                    "Missing langchain-huggingface.\n\n"
+                    "Run:\n"
+                    "pip install -U langchain-huggingface sentence-transformers"
                 )
-            self.embeddings = GoogleGenerativeAIEmbeddings(
-                model=getattr(config, "GEMINI_EMBEDDINGS_MODEL", "models/embedding-001"),
-                google_api_key=getattr(config, "GOOGLE_API_KEY"),
+
+            model_name = getattr(
+                config,
+                "LOCAL_EMBEDDINGS_MODEL",
+                "all-MiniLM-L6-v2",
             )
+
+            print(
+                f"[RAG] Loading local embedding model: {model_name}"
+            )
+
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=model_name,
+                model_kwargs={
+                    "device": "cpu",
+                },
+                encode_kwargs={
+                    "normalize_embeddings": True,
+                },
+            )
+
+            print(
+                "[RAG] Local embeddings loaded."
+            )
+
+        elif self.emb_provider == "gemini":
+
+            raise ValueError(
+                "Gemini embeddings are not configured in this version. "
+                "Use EMBEDDINGS_PROVIDER=local."
+            )
+
         else:
-            # openai
-            if not getattr(config, "OPENAI_API_KEY", ""):
-                raise ValueError("OPENAI_API_KEY is required when EMBEDDINGS_PROVIDER=openai")
-            self.embeddings = OpenAIEmbeddings(openai_api_key=getattr(config, "OPENAI_API_KEY"))
+
+            api_key = getattr(
+                config,
+                "OPENAI_API_KEY",
+                "",
+            )
+
+            if not api_key:
+
+                raise ValueError(
+                    "OPENAI_API_KEY is required when "
+                    "EMBEDDINGS_PROVIDER=openai"
+                )
+
+            self.embeddings = OpenAIEmbeddings(
+                openai_api_key=api_key
+            )
+
+        # -------------------------------------------------
+        # Vector store
+        # -------------------------------------------------
 
         self.vectorstore: Optional[Chroma] = None
 
+        # -------------------------------------------------
+        # Text splitter
+        # -------------------------------------------------
+
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=config.CHUNK_SIZE,
-            chunk_overlap=config.CHUNK_OVERLAP,
+            chunk_size=int(
+                getattr(
+                    config,
+                    "CHUNK_SIZE",
+                    1000,
+                )
+            ),
+            chunk_overlap=int(
+                getattr(
+                    config,
+                    "CHUNK_OVERLAP",
+                    200,
+                )
+            ),
             length_function=len,
         )
 
+        # -------------------------------------------------
+        # LLM
+        # -------------------------------------------------
+
         if self.provider == "gemini":
+
+            if ChatGoogleGenerativeAI is None:
+
+                raise ImportError(
+                    "Gemini dependency missing.\n\n"
+                    "Run:\n"
+                    "pip install -U langchain-google-genai"
+                )
+
+            api_key = getattr(
+                config,
+                "GOOGLE_API_KEY",
+                "",
+            )
+
+            if not api_key:
+
+                raise ValueError(
+                    "GOOGLE_API_KEY is required when "
+                    "PROVIDER=gemini"
+                )
+
+            model = getattr(
+                config,
+                "MODEL_NAME",
+                "gemini-3.6-flash",
+            )
+
+            print(
+                f"[RAG] Gemini model: {model}"
+            )
+
             self.llm = ChatGoogleGenerativeAI(
-                model=getattr(config, "MODEL_NAME", "gemini-1.5-flash"),
-                temperature=config.TEMPERATURE,
-                google_api_key=getattr(config, "GOOGLE_API_KEY"),
+                model=model,
+                temperature=float(
+                    getattr(
+                        config,
+                        "TEMPERATURE",
+                        0.3,
+                    )
+                ),
+                google_api_key=api_key,
             )
+
         else:
+
             self.llm = ChatOpenAI(
-                model_name=getattr(config, "MODEL_NAME", "gpt-4o-mini"),
-                temperature=config.TEMPERATURE,
-                openai_api_key=getattr(config, "OPENAI_API_KEY"),
+                model_name=getattr(
+                    config,
+                    "MODEL_NAME",
+                    "gpt-4o-mini",
+                ),
+                temperature=float(
+                    getattr(
+                        config,
+                        "TEMPERATURE",
+                        0.3,
+                    )
+                ),
+                openai_api_key=getattr(
+                    config,
+                    "OPENAI_API_KEY",
+                    "",
+                ),
             )
 
-        self.logger = logger or JSONLLogger(getattr(config, "LOG_PATH", "logs/qa.jsonl"))
-        self.audit = SQLiteAudit(getattr(config, "AUDIT_DB_PATH", "logs/audit.db"))
+        # -------------------------------------------------
+        # Logging
+        # -------------------------------------------------
 
-    # ----------------------
-    # Ingestion
-    # ----------------------
+        self.logger = (
+            logger
+            or JSONLLogger(
+                getattr(
+                    config,
+                    "LOG_PATH",
+                    "logs/qa.jsonl",
+                )
+            )
+        )
 
-    def load_documents(self, uploaded_files) -> None:
-        """Load and process Streamlit UploadedFile objects."""
+        self.audit = SQLiteAudit(
+            getattr(
+                config,
+                "AUDIT_DB_PATH",
+                "logs/audit.db",
+            )
+        )
+
+    # =====================================================
+    # INGESTION
+    # =====================================================
+
+    def load_documents(
+        self,
+        uploaded_files,
+    ) -> None:
+
         docs: List[Document] = []
 
         for uploaded_file in uploaded_files:
-            suffix = os.path.splitext(uploaded_file.name)[1]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
+
+            suffix = os.path.splitext(
+                uploaded_file.name
+            )[1]
+
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=suffix,
+            ) as tmp_file:
+
+                tmp_file.write(
+                    uploaded_file.getvalue()
+                )
+
                 tmp_path = tmp_file.name
 
             try:
-                docs.extend(self._load_path(tmp_path, source_name=uploaded_file.name))
+
+                loaded = self._load_path(
+                    tmp_path,
+                    source_name=uploaded_file.name,
+                )
+
+                docs.extend(loaded)
+
             finally:
-                os.unlink(tmp_path)
+
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
         self._index_documents(docs)
 
-    def load_manifest_paths(self, paths: Iterable[str]) -> None:
-        """Load and index documents from local file paths (manifest-driven ingestion)."""
-        docs: List[Document] = []
-        for p in paths:
-            p = os.path.expanduser(p)
-            docs.extend(self._load_path(p, source_name=os.path.basename(p)))
-        self._index_documents(docs)
+    # =====================================================
 
-    def load_manifest_docs(self, manifest_docs: Iterable[object]) -> None:
-        """Load and index documents from manifest entries that include metadata.
+    def load_manifest_paths(
+        self,
+        paths: Iterable[str],
+    ) -> None:
 
-        Expected fields (duck-typed): path, id, title, tags, allowed_roles.
-        """
         docs: List[Document] = []
-        for md in manifest_docs:
-            path = os.path.expanduser(getattr(md, "path"))
-            source_name = os.path.basename(path)
-            loaded = self._load_path(path, source_name=source_name)
-            for d in loaded:
-                d.metadata = d.metadata or {}
-                d.metadata["doc_id"] = getattr(md, "id", None)
-                d.metadata["title"] = getattr(md, "title", None)
-                d.metadata["tags"] = list(getattr(md, "tags", []) or [])
-                d.metadata["allowed_roles"] = list(getattr(md, "allowed_roles", []) or [])
+
+        for path in paths:
+
+            path = os.path.expanduser(path)
+
+            loaded = self._load_path(
+                path,
+                source_name=os.path.basename(path),
+            )
+
             docs.extend(loaded)
+
         self._index_documents(docs)
 
-    def _load_path(self, path: str, source_name: str) -> List[Document]:
+    # =====================================================
+
+    def load_manifest_docs(
+        self,
+        manifest_docs: Iterable[object],
+    ) -> None:
+
+        docs: List[Document] = []
+
+        for md in manifest_docs:
+
+            path = os.path.expanduser(
+                getattr(md, "path")
+            )
+
+            source_name = os.path.basename(path)
+
+            loaded = self._load_path(
+                path,
+                source_name=source_name,
+            )
+
+            for doc in loaded:
+
+                doc.metadata = doc.metadata or {}
+
+                doc.metadata["doc_id"] = getattr(
+                    md,
+                    "id",
+                    None,
+                )
+
+                doc.metadata["title"] = getattr(
+                    md,
+                    "title",
+                    None,
+                )
+
+                doc.metadata["tags"] = list(
+                    getattr(
+                        md,
+                        "tags",
+                        [],
+                    )
+                    or []
+                )
+
+                doc.metadata["allowed_roles"] = list(
+                    getattr(
+                        md,
+                        "allowed_roles",
+                        [],
+                    )
+                    or []
+                )
+
+            docs.extend(loaded)
+
+        self._index_documents(docs)
+
+    # =====================================================
+    # LOAD FILE
+    # =====================================================
+
+    def _load_path(
+        self,
+        path: str,
+        source_name: str,
+    ) -> List[Document]:
+
         if path.lower().endswith(".md"):
-            loaded = load_markdown_with_sections(path, source_name=source_name)
-            return loaded
+
+            return load_markdown_with_sections(
+                path,
+                source_name=source_name,
+            )
 
         if path.lower().endswith(".pdf"):
+
             loader = PyPDFLoader(path)
+
         elif path.lower().endswith(".txt"):
-            loader = TextLoader(path, encoding="utf-8")
+
+            loader = TextLoader(
+                path,
+                encoding="utf-8",
+            )
+
         else:
+
             return []
 
         loaded = loader.load()
-        # Normalize metadata so we can cite it later
-        for d in loaded:
-            d.metadata = d.metadata or {}
-            d.metadata.setdefault("source", source_name)
+
+        for doc in loaded:
+
+            doc.metadata = doc.metadata or {}
+
+            doc.metadata.setdefault(
+                "source",
+                source_name,
+            )
+
         return loaded
 
-    def _index_documents(self, documents: List[Document]) -> None:
+    # =====================================================
+    # INDEX DOCUMENTS
+    # =====================================================
+
+    def _index_documents(
+        self,
+        documents: List[Document],
+    ) -> None:
+
         if not documents:
-            raise ValueError("No supported documents found.")
 
-        splits = self.text_splitter.split_documents(documents)
+            raise ValueError(
+                "No supported documents found."
+            )
 
-        # Attach chunk index per source for more stable citations
+        print(
+            f"[RAG] Loaded {len(documents)} document pages."
+        )
+
+        splits = self.text_splitter.split_documents(
+            documents
+        )
+
+        print(
+            f"[RAG] Created {len(splits)} chunks."
+        )
+
         per_source_counts = {}
-        for d in splits:
-            src = (d.metadata or {}).get("source", "unknown")
-            per_source_counts[src] = per_source_counts.get(src, 0) + 1
-            d.metadata["chunk"] = per_source_counts[src]
+
+        for doc in splits:
+
+            source = (
+                doc.metadata or {}
+            ).get(
+                "source",
+                "unknown",
+            )
+
+            per_source_counts[source] = (
+                per_source_counts.get(
+                    source,
+                    0,
+                )
+                + 1
+            )
+
+            doc.metadata["chunk"] = (
+                per_source_counts[source]
+            )
+
+        # -------------------------------------------------
+        # IMPORTANT:
+        #
+        # Use cosine distance from normalized embeddings.
+        # Chroma returns distance, where:
+        #
+        # 0 = identical
+        # larger = less similar
+        #
+        # We do NOT use 1-distance because distances
+        # can be > 1.
+        # -------------------------------------------------
 
         self.vectorstore = Chroma.from_documents(
             documents=splits,
             embedding=self.embeddings,
-            persist_directory=None,  # in-memory
+            persist_directory=None,
         )
 
-    # ----------------------
-    # Retrieval + Generation
-    # ----------------------
+        print(
+            "[RAG] Vector database ready."
+        )
 
-    def _retrieve(self, question: str, k: int, role: Optional[str] = None) -> List[RetrievedChunk]:
+    # =====================================================
+    # RETRIEVAL
+    # =====================================================
+
+    def _retrieve(
+        self,
+        question: str,
+        k: int,
+        role: Optional[str] = None,
+    ) -> List[RetrievedChunk]:
+
         if not self.vectorstore:
-            raise ValueError("No documents loaded. Please upload documents first.")
 
-        # Retrieve extra then filter (Chroma metadata filters vary by backend)
-        raw_k = max(k * 3, k)
+            raise ValueError(
+                "No documents loaded. "
+                "Please upload documents first."
+            )
 
-        pairs: List[Tuple[Document, float]] = self.vectorstore.similarity_search_with_relevance_scores(
-            question, k=raw_k
+        raw_k = max(
+            k * 3,
+            k,
         )
 
-        def allowed(doc: Document) -> bool:
-            if not role or role == "(all)":
+        print(
+            f"[RAG] Searching for: {question}"
+        )
+
+        pairs = (
+            self.vectorstore
+            .similarity_search_with_score(
+                question,
+                k=raw_k,
+            )
+        )
+
+        # -------------------------------------------------
+        # Convert Chroma distance to relevance.
+        #
+        # IMPORTANT FIX:
+        #
+        # OLD:
+        #     relevance = 1 - distance
+        #
+        # This produced 0.0 whenever distance > 1.
+        #
+        # NEW:
+        #     relevance = 1 / (1 + distance)
+        #
+        # This always gives a useful value between 0 and 1.
+        # -------------------------------------------------
+
+        converted = []
+
+        for doc, distance in pairs:
+
+            try:
+
+                distance = float(distance)
+
+                relevance = (
+                    1.0
+                    / (1.0 + max(distance, 0.0))
+                )
+
+            except Exception:
+
+                relevance = 0.0
+
+            converted.append(
+                (
+                    doc,
+                    relevance,
+                )
+            )
+
+        pairs = converted
+
+        # -------------------------------------------------
+        # Role filtering
+        # -------------------------------------------------
+
+        def allowed(
+            doc: Document,
+        ) -> bool:
+
+            if (
+                not role
+                or role == "(all)"
+            ):
                 return True
-            roles = (doc.metadata or {}).get("allowed_roles") or []
-            # If no roles are set, treat as public within the app
+
+            roles = (
+                doc.metadata or {}
+            ).get(
+                "allowed_roles"
+            ) or []
+
             if not roles:
                 return True
+
             return role in roles
 
-        filtered = [(d, s) for (d, s) in pairs if allowed(d)][:k]
+        filtered = [
+            (
+                doc,
+                score,
+            )
+            for doc, score in pairs
+            if allowed(doc)
+        ][:k]
+
+        # -------------------------------------------------
+        # Result objects
+        # -------------------------------------------------
 
         out: List[RetrievedChunk] = []
-        for i, (doc, score) in enumerate(filtered, start=1):
-            out.append(RetrievedChunk(doc=doc, score=float(score), idx=i))
+
+        for index, (
+            doc,
+            score,
+        ) in enumerate(
+            filtered,
+            start=1,
+        ):
+
+            out.append(
+                RetrievedChunk(
+                    doc=doc,
+                    score=float(score),
+                    idx=index,
+                )
+            )
+
+        print(
+            "[RAG] Retrieved:",
+            [
+                round(x.score, 4)
+                for x in out
+            ],
+        )
+
         return out
+
+    # =====================================================
+    # QUERY
+    # =====================================================
 
     def query(
         self,
@@ -239,35 +725,68 @@ class RAGPipeline:
         k: Optional[int] = None,
         role: Optional[str] = None,
     ):
-        """Query the RAG system.
 
-        Behavior:
-        - Retrieve top-k chunks with scores
-        - If best score below threshold => "Not in KB yet." (no guessing)
-        - Otherwise generate grounded answer with citations
-        """
+        k = int(
+            k
+            or getattr(
+                config,
+                "K_DOCUMENTS",
+                5,
+            )
+        )
 
-        k = int(k or config.K_DOCUMENTS)
-        threshold = float(getattr(config, "RETRIEVAL_THRESHOLD", 0.35))
+        threshold = float(
+            getattr(
+                config,
+                "RETRIEVAL_THRESHOLD",
+                0.20,
+            )
+        )
 
-        retrieved = self._retrieve(question, k=k, role=role)
-        best_score_raw = retrieved[0].score if retrieved else 0.0
-        best_score = _normalize_retrieval_score(best_score_raw)
+        retrieved = self._retrieve(
+            question,
+            k=k,
+            role=role,
+        )
 
-        if not retrieved or best_score < threshold:
-            answer = "Not in KB yet. Please add the relevant SOP/policy document to the knowledge base."
+        best_score = (
+            retrieved[0].score
+            if retrieved
+            else 0.0
+        )
+
+        print(
+            f"[RAG] Best relevance: {best_score:.4f}"
+        )
+
+        # -------------------------------------------------
+        # SAFETY GATE
+        # -------------------------------------------------
+
+        if (
+            not retrieved
+            or best_score < threshold
+        ):
+
+            answer = (
+                "Not in KB yet. "
+                "Please add the relevant "
+                "document to the knowledge base."
+            )
+
             sources = []
+
             self.logger.log(
                 {
                     "question": question,
                     "best_score": best_score,
-                    "best_score_raw": best_score_raw,
                     "k": k,
                     "status": "not_in_kb",
                     "sources": sources,
                     "answer": answer,
                 }
             )
+
             self.audit.log(
                 QALogRecord(
                     ts=now_iso(),
@@ -279,72 +798,274 @@ class RAGPipeline:
                     answer=answer,
                 )
             )
-            return {"answer": answer, "sources": sources, "retrieval": self._serialize_retrieval(retrieved)}
 
-        # Build context block with stable citation IDs
+            return {
+                "answer": answer,
+                "sources": sources,
+                "retrieval": self._serialize_retrieval(
+                    retrieved
+                ),
+            }
+
+        # =================================================
+        # BUILD CONTEXT
+        # =================================================
+
         ctx_lines = []
         source_map = []
+
         for r in retrieved:
-            md = r.doc.metadata or {}
-            src = md.get("source", "unknown")
-            title = md.get("title")
-            section = md.get("section_path")
-            chunk = md.get("chunk")
-            page = md.get("page")
 
-            label = title or src
-            parts = [f"chunk {chunk}"] if chunk is not None else []
+            metadata = (
+                r.doc.metadata or {}
+            )
+
+            source = metadata.get(
+                "source",
+                "unknown",
+            )
+
+            title = metadata.get(
+                "title"
+            )
+
+            section = metadata.get(
+                "section_path"
+            )
+
+            chunk = metadata.get(
+                "chunk"
+            )
+
+            page = metadata.get(
+                "page"
+            )
+
+            label = title or source
+
+            parts = []
+
+            if chunk is not None:
+
+                parts.append(
+                    f"chunk {chunk}"
+                )
+
             if page is not None:
-                parts.append(f"page {page}")
+
+                parts.append(
+                    f"page {page}"
+                )
+
             if section:
-                parts.append(f"section {section}")
 
-            ref = f"{label} ({', '.join(parts)})" if parts else label
-            source_map.append({"id": r.idx, "ref": ref, "metadata": md})
-            ctx_lines.append(f"[S{r.idx}] {ref}\n{r.doc.page_content}")
+                parts.append(
+                    f"section {section}"
+                )
 
-        context = "\n\n".join(ctx_lines)
+            ref = label
 
-        system = (
-            "You are an internal assistant that MUST answer strictly using the provided SOURCES. "
-            "Do not use outside knowledge. If the answer is not supported by the sources, reply exactly: 'Not in KB yet.'\n\n"
-            "When you answer, include citations like [S1], [S2] next to each claim. "
-            "At the end, include a 'Sources' section listing each used source id with its ref." 
+            if parts:
+
+                ref += (
+                    " ("
+                    + ", ".join(parts)
+                    + ")"
+                )
+
+            source_map.append(
+                {
+                    "id": r.idx,
+                    "ref": ref,
+                    "metadata": metadata,
+                }
+            )
+
+            ctx_lines.append(
+                f"[S{r.idx}] {ref}\n"
+                f"{r.doc.page_content}"
+            )
+
+        context = "\n\n".join(
+            ctx_lines
         )
 
-        user = f"Question: {question}\n\nSOURCES:\n{context}\n\nAnswer:" 
+        # =================================================
+        # PROMPT
+        # =================================================
+
+        system = """
+You are a document question-answering assistant.
+
+IMPORTANT RULES:
+
+1. Answer ONLY using the provided SOURCES.
+2. Do not use outside knowledge.
+3. Do not guess.
+4. Every factual claim must have a citation such as [S1].
+5. If the SOURCES contain enough information, answer the question.
+6. If the SOURCES do not contain enough information, say:
+   Not in KB yet.
+7. Keep the answer clear and concise.
+8. At the end include a Sources section.
+"""
+
+        user = f"""
+Question:
+
+{question}
+
+SOURCES:
+
+{context}
+
+Answer using ONLY the sources above.
+"""
+
+        # =================================================
+        # CALL GEMINI / OPENAI
+        # =================================================
 
         if temperature is not None:
-            self.llm.temperature = float(temperature)
 
-        msg = self.llm.invoke([{"role": "system", "content": system}, {"role": "user", "content": user}])
-        answer_text = _message_to_text(msg).strip()
+            try:
 
-        # If model didn't cite anything, enforce safe behavior
-        if "[S" not in answer_text and "Not in KB yet" not in answer_text:
-            answer_text = "Not in KB yet. Please add the relevant SOP/policy document to the knowledge base."
+                self.llm.temperature = float(
+                    temperature
+                )
 
-        used_ids = sorted({int(m.group(1)) for m in re.finditer(r"\[S(\d+)\]", answer_text)})
-        used_sources = [s for s in source_map if s["id"] in used_ids] if used_ids else source_map
+            except Exception:
 
-        # Append sources section if missing
+                pass
+
+        print(
+            "[RAG] Calling LLM..."
+        )
+
+        try:
+
+            message = self.llm.invoke(
+                [
+                    {
+                        "role": "system",
+                        "content": system,
+                    },
+                    {
+                        "role": "user",
+                        "content": user,
+                    },
+                ]
+            )
+
+        except Exception as exc:
+
+            print(
+                "[RAG] LLM ERROR:",
+                repr(exc),
+            )
+
+            answer = (
+                "Error while calling the AI model: "
+                + str(exc)
+            )
+
+            return {
+                "answer": answer,
+                "sources": [],
+                "retrieval": self._serialize_retrieval(
+                    retrieved
+                ),
+            }
+
+        answer_text = (
+            _message_to_text(
+                message
+            )
+            .strip()
+        )
+
+        print(
+            "[RAG] LLM response received."
+        )
+
+        # =================================================
+        # CITATION SAFETY
+        # =================================================
+
+        if (
+            "[S"
+            not in answer_text
+            and "Not in KB yet"
+            not in answer_text
+        ):
+
+            answer_text = (
+                "Not in KB yet. "
+                "The model did not provide "
+                "source citations."
+            )
+
+        used_ids = sorted(
+            {
+                int(match.group(1))
+                for match in re.finditer(
+                    r"\[S(\d+)\]",
+                    answer_text,
+                )
+            }
+        )
+
+        used_sources = [
+            source
+            for source in source_map
+            if source["id"] in used_ids
+        ]
+
+        if not used_sources:
+
+            used_sources = source_map
+
+        # =================================================
+        # SOURCES SECTION
+        # =================================================
+
         if "Sources" not in answer_text:
-            lines = ["\n\nSources:"]
-            for s in used_sources:
-                lines.append(f"- [S{s['id']}] {s['ref']}")
-            answer_text = answer_text + "\n" + "\n".join(lines)
+
+            source_lines = [
+                "",
+                "",
+                "Sources:",
+            ]
+
+            for source in used_sources:
+
+                source_lines.append(
+                    f"- [S{source['id']}] "
+                    f"{source['ref']}"
+                )
+
+            answer_text += "\n".join(
+                source_lines
+            )
+
+        # =================================================
+        # LOGGING
+        # =================================================
 
         self.logger.log(
             {
                 "question": question,
                 "best_score": best_score,
-                "best_score_raw": best_score_raw,
                 "k": k,
                 "status": "answered",
-                "sources": [s["ref"] for s in used_sources],
+                "sources": [
+                    source["ref"]
+                    for source in used_sources
+                ],
                 "answer": answer_text,
             }
         )
+
         self.audit.log(
             QALogRecord(
                 ts=now_iso(),
@@ -352,104 +1073,170 @@ class RAGPipeline:
                 status="answered",
                 best_score=best_score,
                 k=k,
-                sources=[s["ref"] for s in used_sources],
+                sources=[
+                    source["ref"]
+                    for source in used_sources
+                ],
                 answer=answer_text,
             )
         )
 
         return {
             "answer": answer_text,
-            "sources": [s["ref"] for s in used_sources],
-            "retrieval": self._serialize_retrieval(retrieved),
+            "sources": [
+                source["ref"]
+                for source in used_sources
+            ],
+            "retrieval": self._serialize_retrieval(
+                retrieved
+            ),
         }
 
-    def _serialize_retrieval(self, retrieved: List[RetrievedChunk]) -> List[dict]:
-        out = []
+    # =====================================================
+    # SERIALIZE RETRIEVAL
+    # =====================================================
+
+    def _serialize_retrieval(
+        self,
+        retrieved: List[RetrievedChunk],
+    ) -> List[dict]:
+
+        output = []
+
         for r in retrieved:
-            md = r.doc.metadata or {}
-            out.append(
+
+            metadata = (
+                r.doc.metadata or {}
+            )
+
+            output.append(
                 {
                     "id": r.idx,
                     "score": r.score,
-                    "score_norm": _normalize_retrieval_score(r.score),
-                    "source": md.get("source"),
-                    "chunk": md.get("chunk"),
-                    "page": md.get("page"),
+                    "score_norm": r.score,
+                    "source": metadata.get(
+                        "source"
+                    ),
+                    "chunk": metadata.get(
+                        "chunk"
+                    ),
+                    "page": metadata.get(
+                        "page"
+                    ),
                 }
             )
-        return out
+
+        return output
 
 
-def _normalize_retrieval_score(score: float) -> float:
-    """Normalize various backend score conventions to a 0..1-ish relevance.
+# =========================================================
+# HELPERS
+# =========================================================
 
-    `similarity_search_with_relevance_scores` is *supposed* to return relevance in [0,1],
-    but in practice some setups return cosine similarity (-1..1) or distances.
+def _message_to_text(
+    message,
+) -> str:
 
-    This heuristic keeps the safety gate usable across providers/embeddings.
-    """
+    content = getattr(
+        message,
+        "content",
+        message,
+    )
 
-    try:
-        s = float(score)
-    except Exception:
-        return 0.0
+    if isinstance(
+        content,
+        str,
+    ):
 
-    # Already a probability-like relevance
-    if 0.0 <= s <= 1.0:
-        return s
-
-    # Cosine similarity in [-1, 1]
-    if -1.0 <= s <= 1.0:
-        return max(0.0, min(1.0, (s + 1.0) / 2.0))
-
-    # Distance (>=0). Smaller is better.
-    if s >= 0:
-        return 1.0 / (1.0 + s)
-
-    return 0.0
-
-
-def _message_to_text(msg) -> str:
-    """LangChain message content can be str or structured list (provider-dependent).
-
-    Gemini adapters sometimes return `content` as a list of parts.
-    This normalizes it into a plain string.
-    """
-
-    content = getattr(msg, "content", msg)
-    if isinstance(content, str):
         return content
-    if isinstance(content, list):
+
+    if isinstance(
+        content,
+        list,
+    ):
+
         parts: list[str] = []
-        for p in content:
-            if isinstance(p, str):
-                parts.append(p)
-            elif isinstance(p, dict):
-                # common shape: {"type":"text","text":"..."}
-                t = p.get("text") or p.get("content")
-                if isinstance(t, str):
-                    parts.append(t)
+
+        for part in content:
+
+            if isinstance(
+                part,
+                str,
+            ):
+
+                parts.append(part)
+
+            elif isinstance(
+                part,
+                dict,
+            ):
+
+                text = (
+                    part.get("text")
+                    or part.get("content")
+                )
+
+                if isinstance(
+                    text,
+                    str,
+                ):
+
+                    parts.append(text)
+
                 else:
-                    parts.append(json.dumps(p, ensure_ascii=False))
+
+                    parts.append(
+                        json.dumps(
+                            part,
+                            ensure_ascii=False,
+                        )
+                    )
+
             else:
-                parts.append(str(p))
+
+                parts.append(
+                    str(part)
+                )
+
         return "\n".join(parts)
+
     return str(content)
 
 
-def _extract_citation_tokens(text: str) -> List[str]:
-    # naive extraction of [S1], [S2]...
-    out = []
-    i = 0
-    while True:
-        i = text.find("[S", i)
-        if i == -1:
-            break
-        j = text.find("]", i)
-        if j == -1:
-            break
-        token = text[i + 1 : j]
-        if token.startswith("S") and token[1:].isdigit():
-            out.append("[" + token + "]")
-        i = j + 1
-    return out
+def _normalize_retrieval_score(
+    score: float,
+) -> float:
+
+    try:
+
+        return max(
+            0.0,
+            min(
+                1.0,
+                float(score),
+            ),
+        )
+
+    except Exception:
+
+        return 0.0
+
+
+def _extract_citation_tokens(
+    text: str,
+) -> List[str]:
+
+    output = []
+
+    for match in re.finditer(
+        r"\[S\d+\]",
+        text,
+    ):
+
+        token = match.group(0)
+
+        if token not in output:
+
+            output.append(token)
+
+    return output
